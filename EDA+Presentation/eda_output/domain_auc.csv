@@ -1,0 +1,7 @@
+scope,pair,domain_auc
+all,train vs val,0.5010794522235986
+all,train vs test,0.6513565289850337
+normal,train vs val,0.5473549331868937
+normal,train vs test,0.783040453963024
+pneumonia,train vs val,0.5036419392480389
+pneumonia,train vs test,0.5930701715761818
