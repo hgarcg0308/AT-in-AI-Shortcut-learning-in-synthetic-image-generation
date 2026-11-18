@@ -1,0 +1,111 @@
+{
+  "umbral_casi_duplicado": 0.99,
+  "original": {
+    "train": {
+      "normal": 1214,
+      "neumonia": 3494,
+      "total": 4708
+    },
+    "val": {
+      "normal": 135,
+      "neumonia": 389,
+      "total": 524
+    },
+    "test": {
+      "normal": 234,
+      "neumonia": 390,
+      "total": 624
+    }
+  },
+  "train": {
+    "copias_exactas": 18,
+    "etiquetas_contradictorias": 0,
+    "casi_duplicados": 0
+  },
+  "val": {
+    "exactas_en_train": 8,
+    "copias_exactas_internas": 0,
+    "casi_duplicados_contra_train": 0,
+    "casi_duplicados_internos": 0
+  },
+  "test": {
+    "exactas_en_train": 0,
+    "r_max_contra_train": 0.9551830887794495,
+    "n_con_r_mayor_umbral": 0,
+    "modificado": false
+  },
+  "limpio": {
+    "train": {
+      "normal": 1213,
+      "neumonia": 3477,
+      "total": 4690
+    },
+    "val": {
+      "normal": 135,
+      "neumonia": 381,
+      "total": 516
+    },
+    "test": {
+      "normal": 234,
+      "neumonia": 390,
+      "total": 624
+    },
+    "pct_neumonia": {
+      "train": 74.136460554371,
+      "val": 73.83720930232558,
+      "test": 62.5
+    }
+  },
+  "submuestras": [
+    {
+      "semilla": 0,
+      "n_10pct": 469,
+      "clases": {
+        "normal": 121,
+        "neumonia": 348,
+        "total": 469
+      },
+      "auc_dominio_vs_resto": 0.497
+    },
+    {
+      "semilla": 1,
+      "n_10pct": 469,
+      "clases": {
+        "normal": 121,
+        "neumonia": 348,
+        "total": 469
+      },
+      "auc_dominio_vs_resto": 0.495
+    },
+    {
+      "semilla": 2,
+      "n_10pct": 469,
+      "clases": {
+        "normal": 121,
+        "neumonia": 348,
+        "total": 469
+      },
+      "auc_dominio_vs_resto": 0.501
+    },
+    {
+      "semilla": 3,
+      "n_10pct": 469,
+      "clases": {
+        "normal": 121,
+        "neumonia": 348,
+        "total": 469
+      },
+      "auc_dominio_vs_resto": 0.498
+    },
+    {
+      "semilla": 4,
+      "n_10pct": 469,
+      "clases": {
+        "normal": 121,
+        "neumonia": 348,
+        "total": 469
+      },
+      "auc_dominio_vs_resto": 0.476
+    }
+  ]
+}
