@@ -99,7 +99,3 @@ Repeat the Phase 3 probes on the synthetic images. If brightness/contrast or the
 - The filtering classifier shares data with the baseline evaluation classifier.
 - A single dataset and a single generator.
 
-## To be confirmed
-
-- [ ] **Actual image resolution** (28×28 or 256×256): affects DDPM and probe design.
-- [ ] **Total number of duplicates** detected (train↔train and val↔train).
