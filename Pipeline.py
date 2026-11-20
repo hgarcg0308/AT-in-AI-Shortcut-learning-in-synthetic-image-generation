@@ -5,25 +5,25 @@ Lanza el flujo completo para varias semillas (submuestras del 10 %) y varios val
 de guidance, uno detrás de otro, para poder dejarlo corriendo sin vigilarlo.
 
 Para cada semilla hace, en este orden:
-    1. Limpieza.py            (una sola vez para todo el proyecto)
-    2. DDPM.py entrenar       generador entrenado solo con el 10 % de esa semilla
-    3. Verificador.py entrenar clasificador base (también sirve para elegir sintéticas)
-    4. Sondas.py              sondas de atajo sobre las reales (H1)
+    1. Cleaning.py             (una sola vez para todo el proyecto)
+    2. DDPM.py train           generador entrenado solo con el 10 % de esa semilla
+    3. Verifier.py train       clasificador base (también sirve para elegir sintéticas)
+    4. Probes.py               sondas de atajo sobre las reales (H1)
     y, para cada valor de guidance:
-    5. DDPM.py generar        imágenes sintéticas
-    6. Verificador.py evaluar ruido de etiquetas, memorización y KID
-    7. Sondas.py              sondas sobre las sintéticas (H2)
-    8. Escenarios.py          comparación de escenarios (por cada --ratio)
+    5. DDPM.py generate        imágenes sintéticas
+    6. Verifier.py evaluate    ruido de etiquetas, memorización y KID
+    7. Probes.py               sondas sobre las sintéticas (H2)
+    8. Scenarios.py            comparación de escenarios (por cada --ratios)
 y al final:
-    9. Agregar.py             junta todas las semillas (diferencias pareadas con intervalos)
+    9. Aggregate.py            junta todas las semillas (diferencias pareadas con intervalos)
 
 Es REANUDABLE: si un paso ya tiene su resultado, se salta. Si se corta la luz o cierras
-la ventana, vuelve a lanzar el mismo comando y continúa por donde iba. Con --forzar se
+la ventana, vuelve a lanzar el mismo comando y continúa por donde iba. Con --force se
 rehace todo lo seleccionado.
 
 Uso:
     # Primera prueba rápida (1 semilla, entrenamientos cortos, unos minutos con GPU)
-    python Pipeline.py --rapido
+    python Pipeline.py --quick
 
     # Ver qué haría sin ejecutar nada
     python Pipeline.py --dry-run
@@ -32,7 +32,7 @@ Uso:
     python Pipeline.py
 
     # Solo algunos pasos
-    python Pipeline.py --solo sondas escenarios agregar
+    python Pipeline.py --only probes scenarios aggregate
 
     # Más ratios de sintéticas (×1, ×2, ×5): necesita más sintéticas, se calcula solo
     python Pipeline.py --ratios 1 2 5
@@ -54,253 +54,253 @@ from datetime import datetime
 
 import numpy as np
 
-from comun import DIR_SALIDAS, RAIZ, RUTA_LIMPIO, RUTA_SUBMUESTRAS
+from common import OUTPUT_DIR, ROOT, CLEAN_PATH, SUBSAMPLES_PATH
 
-PASOS = ["limpieza", "ddpm", "generar", "verificador", "evaluar", "sondas", "escenarios", "agregar"]
+STEPS = ["cleaning", "ddpm", "generate", "verifier", "evaluate", "probes", "scenarios", "aggregate"]
 
-DIR_DDPM = DIR_SALIDAS / "ddpm"
-DIR_VERIF = DIR_SALIDAS / "verificador"
-DIR_SONDAS = DIR_SALIDAS / "sondas"
-DIR_ESC = DIR_SALIDAS / "escenarios"
-DIR_LOGS = DIR_SALIDAS / "logs"
+DDPM_DIR = OUTPUT_DIR / "ddpm"
+VERIFIER_DIR = OUTPUT_DIR / "verifier"
+PROBES_DIR = OUTPUT_DIR / "probes"
+SCENARIOS_DIR = OUTPUT_DIR / "scenarios"
+LOGS_DIR = OUTPUT_DIR / "logs"
 
 
 # ==========================================================================
 # Ejecutar un script y apuntar cómo ha ido
 # ==========================================================================
-class Ejecutor:
+class Runner:
     def __init__(self, dry_run: bool, log):
         self.dry_run, self.log = dry_run, log
-        self.resumen = []  # (nombre, estado, segundos)
+        self.summary = []  # (nombre, estado, segundos)
 
-    def saltar(self, nombre, motivo="ya existe"):
-        print(f"\n--- {nombre}: saltado ({motivo})")
-        self.resumen.append((nombre, "saltado", 0.0))
+    def skip(self, name, reason="already exists"):
+        print(f"\n--- {name}: skipped ({reason})")
+        self.summary.append((name, "skipped", 0.0))
 
-    def correr(self, nombre, script, argumentos) -> bool:
-        cmd = [sys.executable, str(RAIZ / script), *[str(a) for a in argumentos]]
-        mostrar = " ".join(f'"{c}"' if " " in c else c for c in [script, *[str(a) for a in argumentos]])
-        print(f"\n>>> {nombre}\n    python {mostrar}")
-        self.log.write(f"\n>>> {nombre}\n    python {mostrar}\n")
+    def run(self, name, script, arguments) -> bool:
+        cmd = [sys.executable, str(ROOT / script), *[str(a) for a in arguments]]
+        shown = " ".join(f'"{c}"' if " " in c else c for c in [script, *[str(a) for a in arguments]])
+        print(f"\n>>> {name}\n    python {shown}")
+        self.log.write(f"\n>>> {name}\n    python {shown}\n")
         if self.dry_run:
-            self.resumen.append((nombre, "(simulado)", 0.0))
+            self.summary.append((name, "(simulated)", 0.0))
             return True
         t0 = time.time()
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-        with subprocess.Popen(cmd, cwd=RAIZ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+        with subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                               text=True, encoding="utf-8", errors="replace") as p:
-            for linea in p.stdout:
-                print(linea, end="")
-                self.log.write(linea)
+            for line in p.stdout:
+                print(line, end="")
+                self.log.write(line)
             self.log.flush()
         ok = p.returncode == 0
         dt = time.time() - t0
-        self.resumen.append((nombre, "ok" if ok else "FALLÓ", dt))
+        self.summary.append((name, "ok" if ok else "FAILED", dt))
         if not ok:
-            print(f"!!! {nombre} ha fallado (código {p.returncode}). Se continúa con la siguiente semilla.")
+            print(f"!!! {name} failed (code {p.returncode}). Continuing with the next seed.")
         return ok
 
 
-def paso_ddpm_hecho(semilla: int, pasos: int) -> bool:
-    """El modelo existe Y se entrenó al menos 'pasos' pasos (una prueba corta anterior no cuenta)."""
-    ruta = DIR_DDPM / f"ddpm_semilla{semilla}.pt"
-    if not ruta.exists():
+def ddpm_step_done(seed: int, steps: int) -> bool:
+    """El modelo existe Y se entrenó al menos 'steps' pasos (una prueba corta anterior no cuenta)."""
+    path = DDPM_DIR / f"ddpm_seed{seed}.pt"
+    if not path.exists():
         return False
     try:
         import torch
-        return int(torch.load(ruta, map_location="cpu")["paso"]) >= pasos
+        return int(torch.load(path, map_location="cpu")["step"]) >= steps
     except Exception:
         return False
 
 
-def sinteticas_hechas(ruta, n_por_clase: int) -> bool:
+def synthetic_done(path, n_per_class: int) -> bool:
     """El archivo existe y tiene al menos el número de imágenes pedido."""
-    if not ruta.exists():
+    if not path.exists():
         return False
     try:
-        return len(np.load(ruta)["labels"]) >= 2 * n_por_clase
+        return len(np.load(path)["labels"]) >= 2 * n_per_class
     except Exception:
         return False
 
 
-def limpieza_hecha(semillas) -> bool:
-    if not (RUTA_LIMPIO.exists() and RUTA_SUBMUESTRAS.exists()):
+def cleaning_done(seeds) -> bool:
+    if not (CLEAN_PATH.exists() and SUBSAMPLES_PATH.exists()):
         return False
-    claves = set(np.load(RUTA_SUBMUESTRAS).files)
-    return all(f"idx_10pct_semilla{s}" in claves for s in semillas)
+    keys = set(np.load(SUBSAMPLES_PATH).files)
+    return all(f"idx_10pct_seed{s}" in keys for s in seeds)
 
 
 # ==========================================================================
 # Programa principal
 # ==========================================================================
 def main():
-    ap = argparse.ArgumentParser(description="Flujo completo para varias semillas y valores de guidance")
-    ap.add_argument("--semillas", type=int, nargs="+", default=None, help="submuestras del 10 %% (por defecto 0 1 2 3 4)")
-    ap.add_argument("--guidances", type=float, nargs="+", default=None, help="valores de guidance (por defecto 0 2)")
-    ap.add_argument("--ratios", type=float, nargs="+", default=[1.0], help="sintéticas añadidas = ratio x nº de reales")
-    ap.add_argument("--pasos-ddpm", type=int, default=None, help="pasos de entrenamiento del DDPM (por defecto 20000)")
-    ap.add_argument("--ddpm-canales", type=int, default=64, help="anchura de la U-Net (32 si vas justo)")
-    ap.add_argument("--n-por-clase", type=int, default=None, help="sintéticas a generar por clase (por defecto, las necesarias, mín. 1000)")
-    ap.add_argument("--pasos-muestreo", type=int, default=100, help="pasos al generar (100 = rápido; 1000 = DDPM completo)")
-    ap.add_argument("--verif-epocas", type=int, default=100)
-    ap.add_argument("--reps", type=int, default=None, help="entrenamientos por escenario (por defecto 3)")
-    ap.add_argument("--epocas", type=int, default=None, help="épocas máximas de los clasificadores de escenarios (por defecto 60)")
-    ap.add_argument("--bootstrap", type=int, default=None, help="remuestreos de los intervalos (por defecto 1000)")
-    ap.add_argument("--escenarios", nargs="+", default=None, help="escenarios a evaluar (por defecto todos)")
-    ap.add_argument("--solo", nargs="+", choices=PASOS, default=None, help="ejecutar solo estos pasos")
-    ap.add_argument("--forzar", action="store_true", help="rehacer aunque el resultado ya exista")
-    ap.add_argument("--rapido", action="store_true", help="primera prueba corta de todo el flujo")
-    ap.add_argument("--dry-run", action="store_true", help="solo muestra los comandos, no ejecuta nada")
+    ap = argparse.ArgumentParser(description="Full pipeline for several seeds and guidance values")
+    ap.add_argument("--seeds", type=int, nargs="+", default=None, help="10%% subsamples (default 0 1 2 3 4)")
+    ap.add_argument("--guidances", type=float, nargs="+", default=None, help="guidance values (default 0 2)")
+    ap.add_argument("--ratios", type=float, nargs="+", default=[1.0], help="synthetic added = ratio x number of real")
+    ap.add_argument("--ddpm-steps", type=int, default=None, help="DDPM training steps (default 20000)")
+    ap.add_argument("--ddpm-channels", type=int, default=64, help="U-Net width (32 if tight on resources)")
+    ap.add_argument("--n-per-class", type=int, default=None, help="synthetic images to generate per class (default: as many as needed, min. 1000)")
+    ap.add_argument("--sampling-steps", type=int, default=100, help="steps when generating (100 = fast; 1000 = full DDPM)")
+    ap.add_argument("--verifier-epochs", type=int, default=100)
+    ap.add_argument("--reps", type=int, default=None, help="trainings per scenario (default 3)")
+    ap.add_argument("--epochs", type=int, default=None, help="max epochs of the scenario classifiers (default 60)")
+    ap.add_argument("--bootstrap", type=int, default=None, help="resamples for the intervals (default 1000)")
+    ap.add_argument("--scenarios", nargs="+", default=None, help="scenarios to evaluate (default all)")
+    ap.add_argument("--only", nargs="+", choices=STEPS, default=None, help="run only these steps")
+    ap.add_argument("--force", action="store_true", help="redo even if the result already exists")
+    ap.add_argument("--quick", action="store_true", help="first short test of the whole pipeline")
+    ap.add_argument("--dry-run", action="store_true", help="only shows the commands, runs nothing")
     args = ap.parse_args()
 
     # ---------- valores por defecto (normal o rápido) ----------
-    def v(x, rapido, normal):
-        return x if x is not None else (rapido if args.rapido else normal)
+    def pick(x, quick, normal):
+        return x if x is not None else (quick if args.quick else normal)
 
-    semillas = v(args.semillas, [0], [0, 1, 2, 3, 4])
-    guidances = [float(w) for w in v(args.guidances, [2.0], [0.0, 2.0])]
-    pasos_ddpm = v(args.pasos_ddpm, 3000, 20000)
-    reps = v(args.reps, 2, 3)
-    epocas = v(args.epocas, 30, 60)
-    bootstrap = v(args.bootstrap, 300, 1000)
-    todos = ["base", "clasica", "e1", "e2a", "e2b", "e2c", "e3", "e4", "techo"]
-    escenarios = v(args.escenarios, [e for e in todos if e != "techo"], todos)
-    activos = set(args.solo or PASOS)
+    seeds = pick(args.seeds, [0], [0, 1, 2, 3, 4])
+    guidances = [float(w) for w in pick(args.guidances, [2.0], [0.0, 2.0])]
+    ddpm_steps = pick(args.ddpm_steps, 3000, 20000)
+    reps = pick(args.reps, 2, 3)
+    epochs = pick(args.epochs, 30, 60)
+    bootstrap = pick(args.bootstrap, 300, 1000)
+    all_scenarios = ["base", "classic", "e1", "e2a", "e2b", "e2c", "e3", "e4", "ceiling"]
+    scenarios = pick(args.scenarios, [e for e in all_scenarios if e != "ceiling"], all_scenarios)
+    active = set(args.only or STEPS)
 
     # ---------- cuántas sintéticas hacen falta ----------
     n_real = 469  # estimación (~10 % del train limpio); se afina si ya existe la limpieza
-    if limpieza_hecha(semillas):
+    if cleaning_done(seeds):
         try:
-            from comun import cargar_submuestra
-            n_real = len(cargar_submuestra(semillas[0])[0])
+            from common import load_subsample
+            n_real = len(load_subsample(seeds[0])[0])
         except Exception:
             pass
-    necesarias = int(math.ceil(max(args.ratios) * n_real))
-    n_por_clase = v(args.n_por_clase, 100, max(1000, necesarias))
-    if n_por_clase < necesarias:
-        print(f"AVISO: con --ratio {max(args.ratios):g} hacen falta unas {necesarias} sintéticas por clase y generarás {n_por_clase}. "
-              "Los filtros usarán casi todo el pool y se parecerán entre sí.")
+    needed = int(math.ceil(max(args.ratios) * n_real))
+    n_per_class = pick(args.n_per_class, 100, max(1000, needed))
+    if n_per_class < needed:
+        print(f"WARNING: with --ratios {max(args.ratios):g} about {needed} synthetic images per class are needed and you will generate {n_per_class}. "
+              "The filters will use almost the whole pool and will look alike.")
 
-    DIR_LOGS.mkdir(parents=True, exist_ok=True)
-    log_ruta = DIR_LOGS / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOGS_DIR / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
     print("=" * 78)
-    print(f"Semillas: {semillas} | guidance: {guidances} | ratios: {args.ratios}")
-    print(f"DDPM: {pasos_ddpm} pasos | sintéticas por clase: {n_por_clase} | reps: {reps} | épocas: {epocas} | bootstrap: {bootstrap}")
-    print(f"Escenarios: {escenarios}")
-    print(f"Pasos activos: {sorted(activos, key=PASOS.index)} | forzar: {args.forzar} | dry-run: {args.dry_run}")
-    print(f"Log: {log_ruta}")
+    print(f"Seeds: {seeds} | guidance: {guidances} | ratios: {args.ratios}")
+    print(f"DDPM: {ddpm_steps} steps | synthetic per class: {n_per_class} | reps: {reps} | epochs: {epochs} | bootstrap: {bootstrap}")
+    print(f"Scenarios: {scenarios}")
+    print(f"Active steps: {sorted(active, key=STEPS.index)} | force: {args.force} | dry-run: {args.dry_run}")
+    print(f"Log: {log_path}")
     print("=" * 78)
 
     t_global = time.time()
-    fallos = []
-    with open(log_ruta, "w", encoding="utf-8") as log:
-        ex = Ejecutor(args.dry_run, log)
+    failures = []
+    with open(log_path, "w", encoding="utf-8") as log:
+        ex = Runner(args.dry_run, log)
 
         # ---------- 1) limpieza (una vez) ----------
-        if "limpieza" in activos:
-            if limpieza_hecha(semillas) and not args.forzar:
-                ex.saltar("limpieza")
+        if "cleaning" in active:
+            if cleaning_done(seeds) and not args.force:
+                ex.skip("cleaning")
             else:
-                ok = ex.correr("limpieza", "Limpieza.py", ["--k", max(semillas) + 1])
+                ok = ex.run("cleaning", "Cleaning.py", ["--k", max(seeds) + 1])
                 if not ok:
-                    sys.exit("Sin limpieza no se puede continuar.")
+                    sys.exit("Cannot continue without cleaning.")
 
         # ---------- por semilla ----------
-        for s in semillas:
-            print("\n" + "#" * 78 + f"\n# SEMILLA {s}\n" + "#" * 78)
+        for s in seeds:
+            print("\n" + "#" * 78 + f"\n# SEED {s}\n" + "#" * 78)
             ok = True
 
-            if "ddpm" in activos and ok:
-                if paso_ddpm_hecho(s, pasos_ddpm) and not args.forzar:
-                    ex.saltar(f"s{s} ddpm entrenar", f"ya entrenado con >= {pasos_ddpm} pasos")
+            if "ddpm" in active and ok:
+                if ddpm_step_done(s, ddpm_steps) and not args.force:
+                    ex.skip(f"s{s} ddpm train", f"already trained with >= {ddpm_steps} steps")
                 else:
-                    ok = ex.correr(f"s{s} ddpm entrenar", "DDPM.py",
-                                   ["entrenar", "--semilla", s, "--pasos", pasos_ddpm, "--canales", args.ddpm_canales,
-                                    "--vista-cada", 2000])
+                    ok = ex.run(f"s{s} ddpm train", "DDPM.py",
+                                ["train", "--seed", s, "--steps", ddpm_steps, "--channels", args.ddpm_channels,
+                                 "--preview-every", 2000])
 
-            if "verificador" in activos and ok:
-                if (DIR_VERIF / f"verificador_semilla{s}.pt").exists() and not args.forzar:
-                    ex.saltar(f"s{s} verificador entrenar")
+            if "verifier" in active and ok:
+                if (VERIFIER_DIR / f"verifier_seed{s}.pt").exists() and not args.force:
+                    ex.skip(f"s{s} verifier train")
                 else:
-                    ok = ex.correr(f"s{s} verificador entrenar", "Verificador.py",
-                                   ["entrenar", "--semilla", s, "--epocas", args.verif_epocas])
+                    ok = ex.run(f"s{s} verifier train", "Verifier.py",
+                                ["train", "--seed", s, "--epochs", args.verifier_epochs])
 
-            if "sondas" in activos and ok:
-                if (DIR_SONDAS / f"sondas_semilla{s}.json").exists() and not args.forzar:
-                    ex.saltar(f"s{s} sondas reales (H1)")
+            if "probes" in active and ok:
+                if (PROBES_DIR / f"probes_seed{s}.json").exists() and not args.force:
+                    ex.skip(f"s{s} real probes (H1)")
                 else:
-                    ok = ex.correr(f"s{s} sondas reales (H1)", "Sondas.py", ["--semilla", s, "--bootstrap", bootstrap])
+                    ok = ex.run(f"s{s} real probes (H1)", "Probes.py", ["--seed", s, "--bootstrap", bootstrap])
 
-            techo_hecho = False
+            ceiling_done = False
             for w in guidances:
                 if not ok:
                     break
-                stem = f"sinteticas_semilla{s}_w{w}"
-                npz = DIR_DDPM / f"{stem}.npz"
-                etiqueta = stem.replace("sinteticas_", "")
+                stem = f"synthetic_seed{s}_w{w}"
+                npz = DDPM_DIR / f"{stem}.npz"
+                label = stem.replace("synthetic_", "")
 
-                if "generar" in activos:
-                    if sinteticas_hechas(npz, n_por_clase) and not args.forzar:
-                        ex.saltar(f"s{s} w{w:g} generar")
+                if "generate" in active:
+                    if synthetic_done(npz, n_per_class) and not args.force:
+                        ex.skip(f"s{s} w{w:g} generate")
                     else:
-                        ok = ex.correr(f"s{s} w{w:g} generar", "DDPM.py",
-                                       ["generar", "--semilla", s, "--n-normal", n_por_clase, "--n-neumonia", n_por_clase,
-                                        "--guidance", w, "--pasos-muestreo", args.pasos_muestreo])
+                        ok = ex.run(f"s{s} w{w:g} generate", "DDPM.py",
+                                    ["generate", "--seed", s, "--n-normal", n_per_class, "--n-pneumonia", n_per_class,
+                                     "--guidance", w, "--sampling-steps", args.sampling_steps])
                         if not ok:
                             break
 
-                if "evaluar" in activos:
-                    if (DIR_VERIF / f"evaluacion_{stem}.json").exists() and not args.forzar:
-                        ex.saltar(f"s{s} w{w:g} evaluar sintéticas")
+                if "evaluate" in active:
+                    if (VERIFIER_DIR / f"evaluation_{stem}.json").exists() and not args.force:
+                        ex.skip(f"s{s} w{w:g} evaluate synthetic")
                     else:
-                        ok = ex.correr(f"s{s} w{w:g} evaluar sintéticas", "Verificador.py",
-                                       ["evaluar", "--semilla", s, "--sinteticas", npz])
+                        ok = ex.run(f"s{s} w{w:g} evaluate synthetic", "Verifier.py",
+                                    ["evaluate", "--seed", s, "--synthetic", npz])
                         if not ok:
                             break
 
-                if "sondas" in activos:
-                    if (DIR_SONDAS / f"sondas_{etiqueta}.json").exists() and not args.forzar:
-                        ex.saltar(f"s{s} w{w:g} sondas (H2)")
+                if "probes" in active:
+                    if (PROBES_DIR / f"probes_{label}.json").exists() and not args.force:
+                        ex.skip(f"s{s} w{w:g} probes (H2)")
                     else:
-                        ok = ex.correr(f"s{s} w{w:g} sondas (H2)", "Sondas.py",
-                                       ["--semilla", s, "--sinteticas", npz, "--bootstrap", bootstrap])
+                        ok = ex.run(f"s{s} w{w:g} probes (H2)", "Probes.py",
+                                    ["--seed", s, "--synthetic", npz, "--bootstrap", bootstrap])
                         if not ok:
                             break
 
-                if "escenarios" in activos:
+                if "scenarios" in active:
                     for r in args.ratios:
                         # el techo no depende de las sintéticas: se entrena una sola vez por semilla
-                        lista = [e for e in escenarios if not (e == "techo" and techo_hecho)]
-                        if "techo" in lista:
-                            techo_hecho = True
-                        salida = DIR_ESC / f"escenarios_{etiqueta}_x{r:g}.json"
-                        nombre = f"s{s} w{w:g} x{r:g} escenarios"
-                        if salida.exists() and not args.forzar:
-                            ex.saltar(nombre)
+                        lst = [e for e in scenarios if not (e == "ceiling" and ceiling_done)]
+                        if "ceiling" in lst:
+                            ceiling_done = True
+                        out = SCENARIOS_DIR / f"scenarios_{label}_x{r:g}.json"
+                        name = f"s{s} w{w:g} x{r:g} scenarios"
+                        if out.exists() and not args.force:
+                            ex.skip(name)
                             continue
-                        ok = ex.correr(nombre, "Escenarios.py",
-                                       ["--semilla", s, "--sinteticas", npz, "--ratio", r, "--reps", reps,
-                                        "--epocas", epocas, "--bootstrap", bootstrap, "--escenarios", *lista])
+                        ok = ex.run(name, "Scenarios.py",
+                                    ["--seed", s, "--synthetic", npz, "--ratio", r, "--reps", reps,
+                                     "--epochs", epochs, "--bootstrap", bootstrap, "--scenarios", *lst])
                         if not ok:
                             break
                     if not ok:
                         break
 
             if not ok:
-                fallos.append(s)
+                failures.append(s)
 
         # ---------- agregar ----------
-        if "agregar" in activos:
-            ex.correr("agregar semillas", "Agregar.py", [])
+        if "aggregate" in active:
+            ex.run("aggregate seeds", "Aggregate.py", [])
 
         # ---------- resumen ----------
-        print("\n" + "=" * 78 + "\nRESUMEN")
-        for nombre, estado, seg in ex.resumen:
-            t = f"{seg / 60:6.1f} min" if seg else ""
-            print(f"  {nombre:<40s} {estado:<10s} {t}")
-        print(f"Tiempo total: {(time.time() - t_global) / 60:.1f} min")
-        if fallos:
-            print(f"Semillas con algún paso fallido: {fallos}. Revisa el log y relanza el mismo comando para reanudar.")
+        print("\n" + "=" * 78 + "\nSUMMARY")
+        for name, status, sec in ex.summary:
+            t = f"{sec / 60:6.1f} min" if sec else ""
+            print(f"  {name:<40s} {status:<10s} {t}")
+        print(f"Total time: {(time.time() - t_global) / 60:.1f} min")
+        if failures:
+            print(f"Seeds with a failed step: {failures}. Check the log and rerun the same command to resume.")
             sys.exit(1)
 
 
