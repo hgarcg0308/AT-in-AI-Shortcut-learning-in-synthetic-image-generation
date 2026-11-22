@@ -15,8 +15,13 @@ Qué revisa de las imágenes sintéticas:
      con el train frente al parecido que tienen las imágenes reales de val.
   3. Calidad global (KID): ¿se parecen en conjunto a las reales? Se calcula con las
      características internas del verificador.
-  4. Guarda por imagen su probabilidad, entropía y margen, que servirán luego para
-     la selección por incertidumbre (Fase 6).
+  4. Precisión y recall de distribuciones (en el espacio de características del
+     verificador): precisión = ¿caen las sintéticas dentro de lo que cubre lo real?
+     (fidelidad); recall = ¿cubren las sintéticas lo que cubre lo real? (diversidad).
+     Se compara con la referencia val real vs train 10 %.
+  5. Guarda por imagen su probabilidad, entropía y margen, y la incertidumbre
+     epistémica por MC-dropout (información mutua), que sirven luego para la
+     selección por incertidumbre (Fase 6, Scenarios.py).
 
 Uso:
     # 1) Entrenar el verificador con la submuestra del 10 % de la semilla 0
@@ -111,6 +116,42 @@ def predict(model, x_uint8, dev, batch=512):
         probs.append(torch.sigmoid(model.fc2(f).squeeze(1)).cpu())
         feats.append(f.cpu())
     return torch.cat(probs).numpy(), torch.cat(feats).numpy()
+
+
+def binary_entropy(p: np.ndarray) -> np.ndarray:
+    """Entropía (en nats) de una probabilidad de clase binaria."""
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return -(p * np.log(p) + (1 - p) * np.log(1 - p))
+
+
+@torch.no_grad()
+def predict_mc(model, x_uint8, dev, n_passes=30, batch=512) -> dict:
+    """
+    MC-dropout: repite la predicción n_passes veces con el dropout ACTIVO (BatchNorm en
+    modo evaluación) y mide cuánto cambia. Devuelve, por imagen:
+        p_mean          probabilidad media de neumonía
+        std             desviación típica de la probabilidad entre pasadas
+        entropy         entropía predictiva  H[ p_mean ]            (incertidumbre total)
+        expected_entropy media de H[ p_t ] entre pasadas            (parte aleatoria)
+        mutual_info     entropy - expected_entropy                  (parte epistémica, BALD)
+    Limitación: el modelo solo tiene dropout en la cabeza densa (sobre el vector de 64
+    características), así que la incertidumbre epistémica que se mide es la de esa cabeza,
+    no la de toda la red. Sirve para ordenar imágenes, no como estimación calibrada.
+    """
+    model.eval()
+    model.drop.train()  # solo el dropout activo
+    chunks = []
+    try:
+        for i in range(0, len(x_uint8), batch):
+            f = model.features(to_tensor(x_uint8[i:i + batch], dev))  # determinista (BatchNorm en eval)
+            chunks.append(torch.stack([torch.sigmoid(model.fc2(model.drop(f)).squeeze(1))
+                                       for _ in range(n_passes)]).cpu())
+    finally:
+        model.eval()
+    P = torch.cat(chunks, dim=1).numpy()  # (n_passes, N)
+    total, expected = binary_entropy(P.mean(axis=0)), binary_entropy(P).mean(axis=0)
+    return {"p_mean": P.mean(axis=0), "std": P.std(axis=0), "entropy": total,
+            "expected_entropy": expected, "mutual_info": np.maximum(total - expected, 0.0)}
 
 
 def metrics(y, p, threshold=0.5) -> dict:
@@ -234,6 +275,54 @@ def kid(fa: np.ndarray, fb: np.ndarray, n_subsets=50, size=100, seed=0):
     return float(np.mean(values)), float(np.std(values))
 
 
+def _distances(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Distancias euclídeas entre todas las filas de a y de b."""
+    d = (a ** 2).sum(1)[:, None] + (b ** 2).sum(1)[None, :] - 2 * a @ b.T
+    return np.sqrt(np.maximum(d, 0.0))
+
+
+def precision_recall(f_real: np.ndarray, f_fake: np.ndarray, k=3, n_repeats=10, seed=0) -> dict:
+    """
+    Precisión y recall de distribuciones (Kynkäänniemi et al., 2019) con k vecinos.
+    El "soporte" de cada conjunto es la unión de bolas centradas en sus puntos, con radio la
+    distancia a su k-ésimo vecino.
+        precisión = fracción de puntos de f_fake que caen dentro del soporte de f_real
+        recall    = fracción de puntos de f_real que caen dentro del soporte de f_fake
+    Los dos conjuntos se submuestrean al mismo tamaño (el del más pequeño) y se promedia sobre
+    n_repeats, porque el soporte de un conjunto grande es mayor solo por tener más puntos.
+    Devuelve {"precision": [media, sd], "recall": [media, sd], "n_per_set": m}.
+    """
+    rng = np.random.default_rng(seed)
+    m = min(len(f_real), len(f_fake))
+    if m <= k + 1:
+        nan = float("nan")
+        return {"precision": [nan, nan], "recall": [nan, nan], "n_per_set": int(m)}
+    precisions, recalls = [], []
+    for _ in range(n_repeats):
+        a = f_real[rng.choice(len(f_real), m, replace=False)].astype(np.float64)
+        b = f_fake[rng.choice(len(f_fake), m, replace=False)].astype(np.float64)
+        d_ab = _distances(a, b)
+        r_a = np.sort(_distances(a, a), axis=1)[:, k]  # la columna 0 es el propio punto
+        r_b = np.sort(_distances(b, b), axis=1)[:, k]
+        precisions.append(float((d_ab <= r_a[:, None]).any(axis=0).mean()))
+        recalls.append(float((d_ab <= r_b[None, :]).any(axis=1).mean()))
+    return {"precision": [float(np.mean(precisions)), float(np.std(precisions))],
+            "recall": [float(np.mean(recalls)), float(np.std(recalls))], "n_per_set": int(m)}
+
+
+def uncertainty_summary(mc: dict, labels: np.ndarray) -> dict:
+    """Medias de la incertidumbre MC-dropout, en total y por clase."""
+    def one(mask):
+        return {"mean_mutual_info": float(mc["mutual_info"][mask].mean()),
+                "mean_predictive_entropy": float(mc["entropy"][mask].mean()),
+                "mean_mc_std": float(mc["std"][mask].mean()), "n": int(mask.sum())}
+    out = {"all": one(np.ones(len(labels), dtype=bool))}
+    for c, name in ((0, "normal"), (1, "pneumonia")):
+        if (labels == c).any():
+            out[name] = one(labels == c)
+    return out
+
+
 # ==========================================================================
 # 4. Evaluación de las imágenes sintéticas
 # ==========================================================================
@@ -296,12 +385,40 @@ def evaluate(args):
         print(f"    {name_c:9s}: synthetic {k_synth[0]:.4f} ± {k_synth[1]:.4f} | real val (reference) {k_ref[0]:.4f} ± {k_ref[1]:.4f}")
     print("    (the verifier was trained on the 10% train, so the reference KID is somewhat optimistic)")
 
-    # ---------- 4) Incertidumbre por imagen (para la Fase 6) ----------
+    # ---------- 4) Precisión / recall de distribuciones ----------
+    res["precision_recall"] = {}
+    print(f"\n[4] Distribution precision / recall (k = {args.pr_k}, same feature space as KID)")
+    print("    precision = fidelity (synthetic inside the real support); recall = coverage / diversity")
+    for c, name_c in ((0, "normal"), (1, "pneumonia")):
+        if (ys == c).sum() < 5:
+            continue
+        pr_s = precision_recall(f_10[y10 == c], f_s[ys == c], k=args.pr_k)
+        pr_ref = precision_recall(f_10[y10 == c], f_va[yva == c], k=args.pr_k)
+        res["precision_recall"][name_c] = {"synthetic_vs_train10": pr_s, "real_val_vs_train10_(reference)": pr_ref}
+        print(f"    {name_c:9s}: synthetic P {pr_s['precision'][0]:.3f} / R {pr_s['recall'][0]:.3f} "
+              f"| real val (reference) P {pr_ref['precision'][0]:.3f} / R {pr_ref['recall'][0]:.3f} "
+              f"(sets of {pr_s['n_per_set']} / {pr_ref['n_per_set']} images)")
+
+    # ---------- 5) Incertidumbre por imagen (para la Fase 6) ----------
     p_c = np.clip(p_s, 1e-6, 1 - 1e-6)
     entropy = -(p_c * np.log(p_c) + (1 - p_c) * np.log(1 - p_c))
     margin = np.abs(2 * p_s - 1)
+    if model.drop.p == 0:
+        print("\nWARNING: the verifier was trained with dropout 0, so MC-dropout has nothing to vary (epistemic = 0).")
+    set_seed(args.seed)
+    mc_s, mc_va = predict_mc(model, xs, dev, args.mc_passes), predict_mc(model, xva, dev, args.mc_passes)
+    res["uncertainty"] = {"mc_passes": int(args.mc_passes), "dropout_p": float(model.drop.p),
+                          "synthetic": uncertainty_summary(mc_s, ys),
+                          "real_val_(reference)": uncertainty_summary(mc_va, yva)}
+    print(f"\n[5] Epistemic uncertainty (MC-dropout, {args.mc_passes} passes; mutual information, nats)")
+    for c, name_c in ((0, "normal"), (1, "pneumonia")):
+        s_, v_ = res["uncertainty"]["synthetic"].get(name_c), res["uncertainty"]["real_val_(reference)"].get(name_c)
+        if s_ and v_:
+            print(f"    {name_c:9s}: synthetic {s_['mean_mutual_info']:.4f} | real val (reference) {v_['mean_mutual_info']:.4f}")
     np.savez_compressed(VERIFIER_DIR / f"evaluation_{name}.npz", p_pneumonia=p_s, requested_label=ys,
-                        entropy=entropy, margin=margin, r_max_train=r_synth, train_neighbor=nb_synth)
+                        entropy=entropy, margin=margin, r_max_train=r_synth, train_neighbor=nb_synth,
+                        mc_p_mean=mc_s["p_mean"], mc_std=mc_s["std"], mc_entropy=mc_s["entropy"],
+                        mc_expected_entropy=mc_s["expected_entropy"], mutual_info=mc_s["mutual_info"])
     with open(VERIFIER_DIR / f"evaluation_{name}.json", "w") as f:
         json.dump(res, f, indent=2)
 
@@ -356,6 +473,8 @@ def main():
     v = sub.add_parser("evaluate", help="checks a file of synthetic images")
     v.add_argument("--seed", type=int, default=0, help="verifier and reference subsample")
     v.add_argument("--synthetic", required=True, help="path to the .npz generated by DDPM.py")
+    v.add_argument("--mc-passes", type=int, default=30, help="MC-dropout passes for the epistemic uncertainty")
+    v.add_argument("--pr-k", type=int, default=3, help="neighbors k for the distribution precision / recall")
     v.set_defaults(func=evaluate)
 
     args = ap.parse_args()

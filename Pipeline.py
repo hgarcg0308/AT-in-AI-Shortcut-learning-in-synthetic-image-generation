@@ -6,6 +6,8 @@ de guidance, uno detrás de otro, para poder dejarlo corriendo sin vigilarlo.
 
 Para cada semilla hace, en este orden:
     1. Cleaning.py             (una sola vez para todo el proyecto)
+    1b. Shift.py               desplazamiento train vs test: prevalencia, clasificador de
+                               dominio, KS y mapa de diferencias (una sola vez, no depende de la semilla)
     2. DDPM.py train           generador entrenado solo con el 10 % de esa semilla
     3. Verifier.py train       clasificador base (también sirve para elegir sintéticas)
     4. Probes.py               sondas de atajo sobre las reales (H1)
@@ -28,11 +30,15 @@ Uso:
     # Ver qué haría sin ejecutar nada
     python Pipeline.py --dry-run
 
-    # Flujo largo completo (5 semillas, guidance 0 y 2, 20000 pasos): déjalo de noche
+    # Flujo largo completo (5 semillas, guidance 0, 2 y 5, 20000 pasos): déjalo de noche
+    # (para el flujo anterior, sin guidance 5:  python Pipeline.py --guidances 0 2)
     python Pipeline.py
 
     # Solo algunos pasos
     python Pipeline.py --only probes scenarios aggregate
+
+    # Solo el análisis de desplazamiento train vs test
+    python Pipeline.py --only shift
 
     # Más ratios de sintéticas (×1, ×2, ×5): necesita más sintéticas, se calcula solo
     python Pipeline.py --ratios 1 2 5
@@ -56,8 +62,9 @@ import numpy as np
 
 from common import OUTPUT_DIR, ROOT, CLEAN_PATH, SUBSAMPLES_PATH
 
-STEPS = ["cleaning", "ddpm", "generate", "verifier", "evaluate", "probes", "scenarios", "aggregate"]
+STEPS = ["cleaning", "shift", "ddpm", "generate", "verifier", "evaluate", "probes", "scenarios", "aggregate"]
 
+SHIFT_DIR = OUTPUT_DIR / "shift"
 DDPM_DIR = OUTPUT_DIR / "ddpm"
 VERIFIER_DIR = OUTPUT_DIR / "verifier"
 PROBES_DIR = OUTPUT_DIR / "probes"
@@ -136,7 +143,7 @@ def cleaning_done(seeds) -> bool:
 def main():
     ap = argparse.ArgumentParser(description="Full pipeline for several seeds and guidance values")
     ap.add_argument("--seeds", type=int, nargs="+", default=None, help="10%% subsamples (default 0 1 2 3 4)")
-    ap.add_argument("--guidances", type=float, nargs="+", default=None, help="guidance values (default 0 2)")
+    ap.add_argument("--guidances", type=float, nargs="+", default=None, help="guidance values (default 0 2 5; 5 is high on purpose to test whether the shortcut gets amplified)")
     ap.add_argument("--ratios", type=float, nargs="+", default=[1.0], help="synthetic added = ratio x number of real")
     ap.add_argument("--ddpm-steps", type=int, default=None, help="DDPM training steps (default 20000)")
     ap.add_argument("--ddpm-channels", type=int, default=64, help="U-Net width (32 if tight on resources)")
@@ -158,12 +165,12 @@ def main():
         return x if x is not None else (quick if args.quick else normal)
 
     seeds = pick(args.seeds, [0], [0, 1, 2, 3, 4])
-    guidances = [float(w) for w in pick(args.guidances, [2.0], [0.0, 2.0])]
+    guidances = [float(w) for w in pick(args.guidances, [2.0], [0.0, 2.0, 5.0])]
     ddpm_steps = pick(args.ddpm_steps, 3000, 20000)
     reps = pick(args.reps, 2, 3)
     epochs = pick(args.epochs, 30, 60)
     bootstrap = pick(args.bootstrap, 300, 1000)
-    all_scenarios = ["base", "classic", "e1", "e2a", "e2b", "e2c", "e3", "e4", "ceiling"]
+    all_scenarios = ["base", "classic", "e1", "e2a", "e2b", "e2c", "e2d", "e2e", "e3", "e4", "ceiling"]
     scenarios = pick(args.scenarios, [e for e in all_scenarios if e != "ceiling"], all_scenarios)
     active = set(args.only or STEPS)
 
@@ -204,6 +211,13 @@ def main():
                 ok = ex.run("cleaning", "Cleaning.py", ["--k", max(seeds) + 1])
                 if not ok:
                     sys.exit("Cannot continue without cleaning.")
+
+        # ---------- 1b) desplazamiento train vs test (una vez; no depende de la semilla) ----------
+        if "shift" in active:
+            if (SHIFT_DIR / "shift.json").exists() and not args.force:
+                ex.skip("shift (train vs test)")
+            else:
+                ex.run("shift (train vs test)", "Shift.py", ["--bootstrap", bootstrap])
 
         # ---------- por semilla ----------
         for s in seeds:

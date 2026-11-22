@@ -15,10 +15,19 @@ Escenarios (cada clave se puede activar o no con --scenarios):
     e2a      10 % real + sintéticas "fáciles"   (el verificador está muy seguro de su clase)
     e2b      10 % real + sintéticas "medias"    (confianza intermedia)
     e2c      10 % real + sintéticas "frontera"  (el verificador duda)
+    e2d      10 % real + sintéticas de BAJA incertidumbre epistémica  (MC-dropout: el modelo "las conoce")
+    e2e      10 % real + sintéticas de ALTA incertidumbre epistémica  (MC-dropout: al modelo le falta conocimiento)
     e3       10 % real + sintéticas "peores"    (el verificador NO está de acuerdo con la
                                                 clase pedida; control negativo)
     e4       solo sintéticas
     ceiling  todo el train limpio (cota superior con todos los datos reales)
+
+Sobre la entropía y el margen: en un clasificador binario la entropía predictiva y el margen
+|2p-1| son transformaciones monótonas de |p-0.5|, así que ordenan las imágenes exactamente igual
+que el filtro 'frontera' (e2c). Por eso no se entrenan como escenarios aparte; se verifica con la
+correlación de Spearman entre puntuaciones que se imprime y se guarda. Lo que sí aporta información
+distinta es la incertidumbre epistémica (e2d/e2e), que viene del desacuerdo entre pasadas de
+MC-dropout (ver predict_mc en Verifier.py; solo varía la cabeza densa de la red).
 
 Controles importantes:
   * Mismo número de imágenes: base aparte, todos los escenarios con sintéticas
@@ -56,11 +65,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 
 from common import OUTPUT_DIR, load_clean, load_subsample, pick_device, set_seed
 from Probes import BLUE, ORANGE, dot_figure
-from Verifier import VerifierCNN, to_tensor, load_verifier, shift, predict
+from Verifier import (VerifierCNN, binary_entropy, load_verifier, predict, predict_mc, shift,
+                      to_tensor)
 
 SCENARIOS_DIR = OUTPUT_DIR / "scenarios"
 
@@ -71,11 +82,14 @@ NAMES = {
     "e2a": "E2a real + easy synth.",
     "e2b": "E2b real + medium synth.",
     "e2c": "E2c real + boundary synth.",
+    "e2d": "E2d real + low-epistemic synth.",
+    "e2e": "E2e real + high-epistemic synth.",
     "e3": "E3 real + worst synth. (control)",
     "e4": "E4 synthetic only",
     "ceiling": "Ceiling (all clean train)",
 }
-SELECTION_MODE = {"e1": "random", "e2a": "easy", "e2b": "medium", "e2c": "boundary", "e3": "worst"}
+SELECTION_MODE = {"e1": "random", "e2a": "easy", "e2b": "medium", "e2c": "boundary", "e2d": "epi_low",
+                  "e2e": "epi_high", "e3": "worst"}
 
 
 # ==========================================================================
@@ -86,7 +100,7 @@ def confidence_in_requested_class(p_pneumonia: np.ndarray, y_requested: np.ndarr
     return np.where(y_requested == 1, p_pneumonia, 1 - p_pneumonia)
 
 
-def select(conf, y_requested, k_per_class: int, mode: str, rng) -> np.ndarray:
+def select(conf, y_requested, k_per_class: int, mode: str, rng, epi=None) -> np.ndarray:
     """
     Elige k sintéticas por clase según el modo:
       random   : al azar
@@ -94,6 +108,8 @@ def select(conf, y_requested, k_per_class: int, mode: str, rng) -> np.ndarray:
       medium   : las de confianza intermedia (franja central)
       boundary : las más cercanas a 0.5 (el verificador duda)
       worst    : las de menor confianza en la clase pedida (suelen tener la etiqueta "mal")
+      epi_low  : las de menor incertidumbre epistémica (información mutua de MC-dropout)
+      epi_high : las de mayor incertidumbre epistémica
     """
     chosen = []
     for c in (0, 1):
@@ -108,6 +124,11 @@ def select(conf, y_requested, k_per_class: int, mode: str, rng) -> np.ndarray:
             sel = ic[np.argsort(cc)[:k]]
         elif mode == "boundary":
             sel = ic[np.argsort(np.abs(cc - 0.5))[:k]]
+        elif mode in ("epi_low", "epi_high"):
+            if epi is None:
+                raise ValueError("the epistemic modes need the MC-dropout uncertainty (epi)")
+            order = np.argsort(epi[ic])
+            sel = ic[order[:k]] if mode == "epi_low" else ic[order[::-1][:k]]
         elif mode == "medium":
             order = np.argsort(cc)
             start = (len(ic) - k) // 2
@@ -239,9 +260,13 @@ def ci(v) -> tuple:
 # 5. Montar los conjuntos de entrenamiento de cada escenario
 # ==========================================================================
 def build_scenarios(args, x10, y10, data, pool, rng):
-    """Devuelve {clave: (x, y)} con el conjunto de entrenamiento de cada escenario."""
+    """
+    Devuelve ({clave: (x, y)}, {clave: diagnóstico}). El diagnóstico dice qué se ha elegido en cada
+    escenario con selección: % de imágenes donde el verificador no está de acuerdo con la clase
+    pedida, confianza media e incertidumbre epistémica media de lo añadido.
+    """
     n_real = len(x10)
-    xs, ys, conf = pool if pool is not None else (None, None, None)
+    xs, ys, conf, epi = pool if pool is not None else (None, None, None, None)
 
     k = 0
     if xs is not None:
@@ -256,7 +281,7 @@ def build_scenarios(args, x10, y10, data, pool, rng):
             print("WARNING: the whole pool is used, so the filters (easy/medium/boundary/worst) "
                   "will pick the same images. Generate more synthetic images or lower --n-synth-per-class.")
 
-    sc = {}
+    sc, diag = {}, {}
     for key in args.scenarios:
         if key == "base":
             sc[key] = (x10, y10)
@@ -264,15 +289,19 @@ def build_scenarios(args, x10, y10, data, pool, rng):
             xa, ya = classic_augment(x10, y10, 2 * k, rng)
             sc[key] = (np.concatenate([x10, xa]), np.concatenate([y10, ya]))
         elif key in SELECTION_MODE:
-            sel = select(conf, ys, k, SELECTION_MODE[key], rng)
+            sel = select(conf, ys, k, SELECTION_MODE[key], rng, epi)
             sc[key] = (np.concatenate([x10, xs[sel]]), np.concatenate([y10, ys[sel]]))
+            if conf is not None:
+                diag[key] = {"n_added": int(len(sel)), "pct_verifier_disagrees": float((conf[sel] < 0.5).mean() * 100),
+                             "mean_confidence": float(conf[sel].mean()),
+                             "mean_mutual_info": float(epi[sel].mean()) if epi is not None else None}
         elif key == "e4":
             kt = max(1, int(round((n_real + 2 * k) / 2)))
             sel = select(conf if conf is not None else np.zeros(len(ys)), ys, kt, "random", rng)
             sc[key] = (xs[sel], ys[sel])
         elif key == "ceiling":
             sc[key] = (data["train_x"], data["train_y"])
-    return sc
+    return sc, diag
 
 
 # ==========================================================================
@@ -301,6 +330,7 @@ def main():
     ap.add_argument("--train-aug", action="store_true",
                     help="adds small shifts while training (default NO, so it is not mixed with 'classic')")
     ap.add_argument("--bootstrap", type=int, default=1000)
+    ap.add_argument("--mc-passes", type=int, default=30, help="MC-dropout passes for the epistemic uncertainty")
     args = ap.parse_args()
 
     needs_synth = [e for e in args.scenarios if e not in ("base", "classic", "ceiling")]
@@ -317,25 +347,44 @@ def main():
     print(f"Device: {dev} | real 10%: {len(x10)} | clean val: {len(xva)} | test: {len(xte)}")
 
     # ---------- sintéticas y confianza del verificador ----------
-    pool, label = None, f"seed{args.seed}"
+    pool, label, score_spearman = None, f"seed{args.seed}", {}
     if args.synthetic:
         s = np.load(args.synthetic)
         xs, ys = s["images"], s["labels"].astype(int)
-        conf = None
+        conf, epi = None, None
         if any(e in SELECTION_MODE and e != "e1" for e in args.scenarios):
             ver = load_verifier(args.seed, dev)  # avisa si no está entrenado
             p_s, _ = predict(ver, xs, dev)
             conf = confidence_in_requested_class(p_s, ys)
+            set_seed(args.seed)
+            epi = predict_mc(ver, xs, dev, args.mc_passes)["mutual_info"]
             print(f"Verifier: mean confidence in the requested class = {conf.mean():.3f} "
-                  f"| disagreement with the requested class = {(conf < 0.5).mean() * 100:.1f} %")
-        pool = (xs, ys, conf)
+                  f"| disagreement with the requested class = {(conf < 0.5).mean() * 100:.1f} % "
+                  f"| mean epistemic uncertainty = {epi.mean():.4f} nats")
+            # ¿miden lo mismo las puntuaciones? (entropía y margen son redundantes con 'frontera')
+            scores = {"confidence in requested class": conf, "predictive entropy": binary_entropy(p_s),
+                      "margin abs(2p-1)": np.abs(2 * p_s - 1), "epistemic (MC-dropout)": epi}
+            names_s = list(scores)
+            score_spearman = {f"{a} vs {b}": float(spearmanr(scores[a], scores[b])[0])
+                              for i, a in enumerate(names_s) for b in names_s[i + 1:]}
+            print("Spearman correlation between selection scores (|rho| = 1: same ranking, redundant filter):")
+            for k_, v_ in score_spearman.items():
+                print(f"    {k_:<62s} {v_:+.2f}")
+        pool = (xs, ys, conf, epi)
         label = Path(args.synthetic).stem.replace("synthetic_", "") + f"_x{args.ratio:g}"
 
-    sc = build_scenarios(args, x10, y10, data, pool, rng)
+    sc, diag = build_scenarios(args, x10, y10, data, pool, rng)
 
     print("\nTraining sets:")
     for c, (x, y) in sc.items():
         print(f"  {NAMES[c]:<40s} {len(x):5d} images (normal {(y == 0).sum()}, pneumonia {(y == 1).sum()})")
+
+    if diag:
+        print("\nWhat each filter selected (added images only):")
+        print(f"  {'scenario':<40s}{'% verifier disagrees':>22s}{'mean confidence':>17s}{'mean epistemic':>16s}")
+        for c, dg in diag.items():
+            mi = "-" if dg["mean_mutual_info"] is None else f"{dg['mean_mutual_info']:.4f}"
+            print(f"  {NAMES[c]:<40s}{dg['pct_verifier_disagrees']:>21.1f}%{dg['mean_confidence']:>17.3f}{mi:>16s}")
 
     # ---------- entrenar ----------
     P_test, P_val = {}, {}
@@ -403,7 +452,9 @@ def main():
     save_csv(rows, SCENARIOS_DIR / f"scenarios_{label}.csv")
     with open(SCENARIOS_DIR / f"scenarios_{label}.json", "w", encoding="utf-8") as f:
         json.dump({"seed": args.seed, "synthetic": args.synthetic, "ratio": args.ratio,
-                   "reps": args.reps, "bootstrap": args.bootstrap, "results": rows}, f, indent=2, ensure_ascii=False)
+                   "reps": args.reps, "bootstrap": args.bootstrap, "mc_passes": args.mc_passes,
+                   "selection_diagnostics": {NAMES[c]: dg for c, dg in diag.items()},
+                   "score_spearman": score_spearman, "results": rows}, f, indent=2, ensure_ascii=False)
     np.savez_compressed(SCENARIOS_DIR / f"probabilities_{label}.npz", y_test=yte, y_val=yva,
                         **{f"test::{k}": v for k, v in P_test.items()}, **{f"val::{k}": v for k, v in P_val.items()})
 

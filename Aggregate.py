@@ -17,11 +17,13 @@ Qué calcula:
   * Atajos: sondas sobre real (H1) y comparación real/sintético (H2), con cuántas
     semillas dan "amplifica", "mitiga" o "sin diferencia clara".
   * Verificador base y diagnóstico de falsos positivos frente al brillo del borde.
+  * Desplazamiento train vs test (lo calcula Shift.py): prevalencia, clasificador de
+    dominio, KS y mapa de diferencias.
 
 Uso:
     python Aggregate.py
 
-Lee de outputs/scenarios, outputs/verifier y outputs/probes, y escribe en
+Lee de outputs/scenarios, outputs/verifier, outputs/probes y outputs/shift, y escribe en
 outputs/summary/: summary.md, varios .csv/.json y las figuras (.png).
 """
 
@@ -50,6 +52,7 @@ SUMMARY_DIR = OUTPUT_DIR / "summary"
 SCENARIOS_DIR = OUTPUT_DIR / "scenarios"
 VERIFIER_DIR = OUTPUT_DIR / "verifier"
 PROBES_DIR = OUTPUT_DIR / "probes"
+SHIFT_DIR = OUTPUT_DIR / "shift"
 
 ORDER = list(NAMES.values())
 BASE, CEILING = NAMES["base"], NAMES["ceiling"]
@@ -129,8 +132,41 @@ def load_scenarios():
         rows = {x["scenario"]: x for x in read_json(f)["results"]}
         data[(w, r)][s] = rows
         if CEILING in rows:
-            ceiling[s] = rows[CEILING]
+            # se guarda también la base del mismo archivo, para las diferencias pareadas de sens. y ECE
+            ceiling[s] = dict(rows[CEILING], _base=rows.get(BASE))
     return data, ceiling
+
+
+def paired_diff(row, base_row, key, is_base):
+    """row[key] - base_row[key] (0 para la propia base, None si no hay base con la que comparar)."""
+    if is_base:
+        return 0.0
+    if base_row is None or row.get(key) is None or base_row.get(key) is None:
+        return None
+    return row[key] - base_row[key]
+
+
+def aggregate_selection():
+    """
+    Lee de cada JSON de escenarios qué eligió cada filtro (% de imágenes añadidas donde el
+    verificador no está de acuerdo con la clase pedida, confianza y epistémica medias) y la
+    correlación de Spearman entre las puntuaciones de selección.
+    Devuelve ({(w, r): {escenario: {métrica: [valores por semilla]}}}, {(w, par): {semilla: rho}}).
+    """
+    sel = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    corr = defaultdict(dict)
+    for f in sorted(SCENARIOS_DIR.glob("scenarios_seed*.json")):
+        m = RE_SC.search(f.name)
+        if not m:
+            continue
+        seed, w, r = int(m[1]), float(m[2]), float(m[3])
+        d = read_json(f)
+        for name, dg in d.get("selection_diagnostics", {}).items():
+            for k, v in dg.items():
+                sel[(w, r)][name][k].append(v)
+        for pair, rho in d.get("score_spearman", {}).items():
+            corr[(w, pair)][seed] = rho  # el pool es el mismo para todos los ratios: una vez por semilla
+    return sel, corr
 
 
 def aggregate_scenarios(data, ceiling):
@@ -151,6 +187,11 @@ def aggregate_scenarios(data, ceiling):
                 v["ece"].append(row["ece_test"])
                 v["d_auc"].append(row.get("delta_auc_vs_base", 0.0))
                 v["d_spec"].append(row.get("delta_spec_vs_base", 0.0))
+                # sensibilidad y ECE: diferencia pareada de estimaciones puntuales (misma semilla y mismo
+                # test) frente a la base; no hay bootstrap, el intervalo es solo entre semillas
+                base_row = row.get("_base") or by_seed[s].get(BASE)
+                v["d_sens"].append(paired_diff(row, base_row, "sens_test", e == BASE))
+                v["d_ece"].append(paired_diff(row, base_row, "ece_test", e == BASE))
             res = {k: summarize(x) for k, x in v.items()}
             values[(w, r, e)] = (dict(v), res)
             rows.append({"guidance": w, "ratio": r, "scenario": e, "n_seeds": res["auc"]["n"],
@@ -160,7 +201,11 @@ def aggregate_scenarios(data, ceiling):
                          "d_auc_mean": res["d_auc"]["mean"], "d_auc_ci_low": res["d_auc"]["ci_low"],
                          "d_auc_ci_high": res["d_auc"]["ci_high"], "d_auc_positive_seeds": res["d_auc"]["positive"],
                          "d_spec_mean": res["d_spec"]["mean"], "d_spec_ci_low": res["d_spec"]["ci_low"],
-                         "d_spec_ci_high": res["d_spec"]["ci_high"], "d_spec_positive_seeds": res["d_spec"]["positive"]})
+                         "d_spec_ci_high": res["d_spec"]["ci_high"], "d_spec_positive_seeds": res["d_spec"]["positive"],
+                         "d_sens_mean": res["d_sens"]["mean"], "d_sens_ci_low": res["d_sens"]["ci_low"],
+                         "d_sens_ci_high": res["d_sens"]["ci_high"], "d_sens_positive_seeds": res["d_sens"]["positive"],
+                         "d_ece_mean": res["d_ece"]["mean"], "d_ece_ci_low": res["d_ece"]["ci_low"],
+                         "d_ece_ci_high": res["d_ece"]["ci_high"], "d_ece_positive_seeds": res["d_ece"]["positive"]})
     return rows, values
 
 
@@ -227,12 +272,22 @@ def aggregate_quality():
             if c in ki:
                 g[f"kid_{c}"].append(ki[c]["synthetic_vs_train10"][0])
                 g[f"kid_ref_{c}"].append(ki[c]["real_val_vs_train10_(reference)"][0])
+        for c, pr in d.get("precision_recall", {}).items():  # ausentes en evaluaciones antiguas
+            g[f"precision_{c}"].append(pr["synthetic_vs_train10"]["precision"][0])
+            g[f"recall_{c}"].append(pr["synthetic_vs_train10"]["recall"][0])
+            g[f"precision_ref_{c}"].append(pr["real_val_vs_train10_(reference)"]["precision"][0])
+            g[f"recall_ref_{c}"].append(pr["real_val_vs_train10_(reference)"]["recall"][0])
+        unc = d.get("uncertainty")
+        if unc:
+            g["mi_synth"].append(unc["synthetic"]["all"]["mean_mutual_info"])
+            g["mi_val"].append(unc["real_val_(reference)"]["all"]["mean_mutual_info"])
     rows = []
     for w in sorted(by_w):
         row = {"guidance": w}
         for k, vals in by_w[w].items():
             r = summarize(vals)
-            row[k], row[k + "_sd"], row["n_seeds"] = r["mean"], r["sd"], r["n"]
+            row[k], row[k + "_sd"] = r["mean"], r["sd"]
+        row["n_seeds"] = len(by_w[w]["disagreement_normal"])
         rows.append(row)
     return rows
 
@@ -293,11 +348,67 @@ def aggregate_verifier():
 
 
 # ==========================================================================
+# 5. Desplazamiento train vs test (Shift.py)
+# ==========================================================================
+def shift_section():
+    """Devuelve las líneas markdown de la sección de desplazamiento, o None si no hay shift.json."""
+    path = SHIFT_DIR / "shift.json"
+    if not path.exists():
+        return None
+    d = read_json(path)
+    md = ["## 0. Dataset shift: clean train vs official test\n"]
+
+    pr = d["prior_shift"]
+    rows = [[k, pr[k]["n"], f"{pr[k]['pct_pneumonia']:.1f} % [{pr[k]['ci_low']:.1f}, {pr[k]['ci_high']:.1f}]"]
+            for k in ("train", "val", "test")]
+    md.append("### Prior (label) shift\n")
+    md.append(md_table(["set", "n", "% pneumonia [95 % CI]"], rows))
+    dp, w = pr["diff_test_minus_train_pp"], pr["importance_weights_test_over_train"]
+    md.append(f"\nTest − train: {dp['value']:+.1f} pp [{dp['ci_low']:+.1f}, {dp['ci_high']:+.1f}]. "
+              f"Importance weights p_test(y)/p_train(y): normal {w['normal']:.2f}, pneumonia {w['pneumonia']:.2f}.\n")
+
+    md.append("### Domain classifier: can an image be told apart as train or test?\n")
+    rows = []
+    for r in d["domain"]:
+        ref = "-" if r["auc_train_vs_val_ref"] is None else fmt(r["auc_train_vs_val_ref"])
+        rows.append([r["group"], r["region"], f"{r['n_train']} / {r['n_test']}",
+                     f"{fmt(r['auc_train_vs_test'])} [{fmt(r['ci_low'])}, {fmt(r['ci_high'])}]",
+                     f"{fmt(r['auc_null'])} [{fmt(r['null_ci_low'])}, {fmt(r['null_ci_high'])}]", ref,
+                     "yes" if r["distinguishable_from_null"] else "no"])
+    md.append(md_table(["class", "region", "n train / test", "AUC train vs test [CI]",
+                        "null AUC (train split at random) [CI]", "AUC train vs val (ref.)",
+                        "above null?"], rows))
+    md.append("\nAUC 0.5 = indistinguishable. 'Above null' means the lower end of the interval is above the upper end "
+              "of the null interval. A high AUC in one class only is class-conditional shift. 'edge' is the outer ring "
+              f"of {d['settings']['k_center']} px and 'center' the rest of the image.\n")
+
+    md.append("### Kolmogorov-Smirnov: distance D between the train and test distributions\n")
+    rows = [[r["group"], r["feature"], f"{fmt(r['D'])} [{fmt(r['ci_low'])}, {fmt(r['ci_high'])}]",
+             fmt(r["noise_floor_p95"]), fmt(r["median_test_minus_train"], 3, True),
+             "yes" if r["above_noise_floor"] else "no"] for r in d["ks"]]
+    md.append(md_table(["class", "statistic", "D [95 % CI]", "noise floor (p95)", "median test − train",
+                        "D above noise?"], rows))
+    md.append("\nD is reported instead of a p-value (with large n everything is 'significant'). The bootstrap interval of "
+              "D tends to sit slightly above the real value when D is small, so compare D with the noise floor: the 95th "
+              "percentile of D if train and test came from the same distribution. KS is univariate and ignores spatial "
+              "structure; the domain classifier complements it. The 'all' rows mix the prior shift with the image shift.\n")
+    if (SHIFT_DIR / "shift_difference_map.png").exists():
+        md.append("![Mean difference test − train, by class and by distance to the border](../shift/shift_difference_map.png)\n")
+    return md
+
+
+# ==========================================================================
 # Programa principal
 # ==========================================================================
 def main():
     SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
     md = [f"# Summary of the pipeline across seeds\n\nGenerated on {datetime.now():%d/%m/%Y %H:%M} by `Aggregate.py`.\n"]
+
+    # ---------- desplazamiento train vs test ----------
+    shift_md = shift_section()
+    if shift_md:
+        md += shift_md
+        print(f"[shift] included from {SHIFT_DIR / 'shift.json'}")
 
     # ---------- verificador base ----------
     ver = aggregate_verifier()
@@ -329,6 +440,19 @@ def main():
                             "near copies r>0.99", "KID normal", "KID pneumonia"], rows))
         md.append("\n*Low disagreement = synthetic images that are easy to classify. 'synth. > val p95' expected ≈ 5 %. "
                   "KID has its own scale: it is only useful for comparing across guidance values.*\n")
+        if any("precision_normal" in c for c in quality):
+            md.append("### Precision / recall of the distribution and epistemic uncertainty\n")
+            pr = lambda c, cls: (f"{fmt(c.get(f'precision_{cls}'))} / {fmt(c.get(f'recall_{cls}'))} "
+                                 f"(ref. {fmt(c.get(f'precision_ref_{cls}'))} / {fmt(c.get(f'recall_ref_{cls}'))})")
+            rows = [[f"{c['guidance']:g}", c.get("n_seeds", "-"), pr(c, "normal"), pr(c, "pneumonia"),
+                     f"{fmt(c.get('mi_synth'), 4)} ({fmt(c.get('mi_val'), 4)})"] for c in quality]
+            md.append(md_table(["guidance", "seeds", "precision / recall normal (real val)",
+                                "precision / recall pneumonia (real val)", "epistemic uncertainty synth. (real val)"], rows))
+            md.append("\n*Precision = fidelity (synthetic inside the real support); recall = coverage (diversity). High precision with "
+                      "recall well below the reference means mode collapse, which is what a high guidance tends to produce. "
+                      "Computed in the verifier's feature space, like KID. Epistemic uncertainty is the mutual information "
+                      "of MC-dropout (nats); the network only has dropout in its dense head, so it is a ranking tool, "
+                      "not a calibrated estimate.*\n")
 
     # ---------- sondas ----------
     h1, h2, gaps, diag, verdicts = aggregate_probes()
@@ -377,27 +501,35 @@ def main():
         md.append("## 5. Scenarios: difference versus base, across seeds\n")
         md.append("Each difference is **paired** (same subsample and same test) and computed per seed. "
                   "`*` marks that the 95% interval across seeds does not include 0. "
-                  "'Seeds +' is in how many seeds the difference is positive.\n")
+                  "'Seeds +' is in how many seeds the difference is positive. Δ AUC and Δ specificity come from the paired \n"
+                  "bootstrap of each seed; Δ sensitivity is the per-seed difference of point estimates (same subsample, same test). \n"
+                  "ECE is the calibration error: lower is better (its paired differences are in `scenarios_summary.csv`).\n")
         for (w, r) in sorted({(k[0], k[1]) for k in values}):
             md.append(f"### Guidance {w:g}, ratio ×{r:g}\n")
-            rows, items_auc, items_spec = [], [], []
+            rows, items_auc, items_spec, items_sens = [], [], [], []
             for e in ORDER:
                 if (w, r, e) not in values:
                     continue
                 v, res = values[(w, r, e)]
-                da, ds = res["d_auc"], res["d_spec"]
+                da, ds, dse = res["d_auc"], res["d_spec"], res["d_sens"]
+                common_cols = [e, res["auc"]["n"], fmt_mean_sd(res["auc"]), fmt_mean_sd(res["sens"]),
+                               fmt_mean_sd(res["spec"]), fmt_mean_sd(res["ece"])]
                 if e == BASE:
-                    rows.append([e, res["auc"]["n"], fmt_mean_sd(res["auc"]), fmt_mean_sd(res["spec"]), "-", "-", "-", "-"])
+                    rows.append(common_cols + ["-", "-", "-", "-", "-"])
                     continue
-                rows.append([e, res["auc"]["n"], fmt_mean_sd(res["auc"]), fmt_mean_sd(res["spec"]),
-                             f"{fmt(da['mean'], 3, True)} [{fmt(da['ci_low'], 3, True)}, {fmt(da['ci_high'], 3, True)}]"
-                             + (" *" if excludes_zero(da) else ""), f"{da['positive']}/{da['n']}",
-                             f"{fmt(ds['mean'], 3, True)} [{fmt(ds['ci_low'], 3, True)}, {fmt(ds['ci_high'], 3, True)}]"
-                             + (" *" if excludes_zero(ds) else ""), f"{ds['positive']}/{ds['n']}"])
+                rows.append(common_cols + [
+                    f"{fmt(da['mean'], 3, True)} [{fmt(da['ci_low'], 3, True)}, {fmt(da['ci_high'], 3, True)}]"
+                    + (" *" if excludes_zero(da) else ""), f"{da['positive']}/{da['n']}",
+                    f"{fmt(dse['mean'], 3, True)} [{fmt(dse['ci_low'], 3, True)}, {fmt(dse['ci_high'], 3, True)}]"
+                    + (" *" if excludes_zero(dse) else ""),
+                    f"{fmt(ds['mean'], 3, True)} [{fmt(ds['ci_low'], 3, True)}, {fmt(ds['ci_high'], 3, True)}]"
+                    + (" *" if excludes_zero(ds) else ""), f"{ds['positive']}/{ds['n']}"])
                 items_auc.append((e, v["d_auc"], da))
                 items_spec.append((e, v["d_spec"], ds))
-            md.append(md_table(["scenario", "seeds", "test AUC", "test specificity", "Δ AUC vs base [CI]",
-                                "seeds +", "Δ specificity vs base [CI]", "seeds +"], rows))
+                items_sens.append((e, v["d_sens"], dse))
+            md.append(md_table(["scenario", "seeds", "test AUC", "test sensitivity", "test specificity", "test ECE",
+                                "Δ AUC vs base [CI]", "seeds +", "Δ sensitivity vs base [CI]",
+                                "Δ specificity vs base [CI]", "seeds +"], rows))
             md.append("")
             if items_auc:
                 tag = f"w{w:g}_x{r:g}"
@@ -405,15 +537,48 @@ def main():
                              "Δ AUC on test (mean of training replicates)", SUMMARY_DIR / f"delta_auc_{tag}.png")
                 delta_figure(items_spec, f"Specificity change versus base (guidance {w:g}, ×{r:g})",
                              "Δ specificity on test (threshold 0.5)", SUMMARY_DIR / f"delta_spec_{tag}.png")
+                delta_figure(items_sens, f"Sensitivity change versus base (guidance {w:g}, ×{r:g})",
+                             "Δ sensitivity on test (threshold 0.5)", SUMMARY_DIR / f"delta_sens_{tag}.png")
             print(f"\n[guidance {w:g}, ratio ×{r:g}]")
             for row in rows:
                 print("  " + " | ".join(str(c) for c in row))
+        sel, corr = aggregate_selection()
+        if sel:
+            md.append("### What each filter actually selected\n")
+            rows, csv_rows = [], []
+            for (w, r) in sorted(sel):
+                for e in ORDER:
+                    if e not in sel[(w, r)]:
+                        continue
+                    g = sel[(w, r)][e]
+                    dis, cf, mi = (summarize(g["pct_verifier_disagrees"]), summarize(g["mean_confidence"]),
+                                   summarize(g.get("mean_mutual_info", [])))
+                    rows.append([f"{w:g}", f"×{r:g}", e, dis["n"], fmt_mean_sd(dis, 1), fmt_mean_sd(cf), fmt_mean_sd(mi, 4)])
+                    csv_rows.append({"guidance": w, "ratio": r, "scenario": e, "n_seeds": dis["n"],
+                                     "pct_verifier_disagrees": dis["mean"], "mean_confidence": cf["mean"],
+                                     "mean_epistemic": mi["mean"]})
+            md.append(md_table(["guidance", "ratio", "scenario", "seeds", "% added where the verifier disagrees",
+                                "mean confidence", "mean epistemic"], rows))
+            md.append("\n*Only the added synthetic images. A filter that improves things while adding many images the verifier "
+                      "disagrees with is not 'cleaning' anything: it is changing something else. The 'epistemic' filters "
+                      "(E2d low, E2e high) use the mutual information of MC-dropout.*\n")
+            save_csv(csv_rows, SUMMARY_DIR / "selection_diagnostics.csv")
+        if corr:
+            ws = sorted({w for (w, _) in corr})
+            pairs = sorted({pair for (_, pair) in corr})
+            rows = [[pair] + [fmt_mean_sd(summarize(list(corr[(w, pair)].values())), 2) if (w, pair) in corr else "-"
+                              for w in ws] for pair in pairs]
+            md.append("### Do the selection scores measure the same thing? (Spearman correlation)\n")
+            md.append(md_table(["pair of scores"] + [f"guidance {w:g}" for w in ws], rows))
+            md.append("\n*|ρ| = 1 means the two scores rank the images identically, so filtering by one or the other selects "
+                      "the same images. Entropy and margin are redundant with the 'boundary' filter (E2c); the epistemic "
+                      "score is the one that adds new information.*\n")
         n_max = max(res["auc"]["n"] for _, res in values.values())
         if n_max < 5:
             md.append(f"> **Note:** there are only {n_max} seed(s). With so few, the intervals across seeds are very "
                       "wide (or do not exist with 1). Run all 5 subsamples for firmer conclusions.\n")
 
-    if not rows_sc and not ver and not quality and not h1:
+    if not rows_sc and not ver and not quality and not h1 and not shift_md:
         raise SystemExit("No results found in outputs/. Run Pipeline.py first (or the individual scripts).")
 
     md.append("## Limitations to declare\n\n"
@@ -423,7 +588,14 @@ def main():
               "- AUC differences of 0.01–0.02 are usually indistinguishable from noise.\n"
               "- The verifier that selects the synthetic images was trained on the same real images, so the selection "
               "is biased toward what it already knows.\n"
-              "- Without a patient identifier, patient-level leakage cannot be ruled out; a single dataset and a single generator.\n")
+              "- Without a patient identifier, patient-level leakage cannot be ruled out; a single dataset and a single generator.\n"
+              "- KID is computed in the feature space of the verifier (a small CNN trained on ~470 images), not in a "
+              "standard Inception space, so it only serves to compare guidance values within this project.\n"
+              "- Memorization is measured with pixel correlation, not with distances between embeddings.\n"
+              "- The number of images cannot be equalized in the synthetic-only scenario or in the ceiling; "
+              "those two comparisons also mix in a different amount of data.\n"
+              "- The domain classifier and the KS test describe the shift between train and test, but they do not prove "
+              "which feature the models use; that is what the shortcut probes are for.\n")
     with open(SUMMARY_DIR / "summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))
     print(f"\nSummary saved in {SUMMARY_DIR} (summary.md, .csv tables and .png figures)")
